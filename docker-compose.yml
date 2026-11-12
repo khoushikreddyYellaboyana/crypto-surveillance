@@ -1,0 +1,97 @@
+# Real-Time Crypto Market Surveillance — full stack
+#   docker compose up -d --build
+#   dashboard: http://localhost:8501     Kafka UI: http://localhost:8080
+name: crypto-surveillance
+
+x-app: &app
+  build: .
+  image: crypto-surveillance:latest
+  restart: unless-stopped
+  environment: &app-env
+    KAFKA_BOOTSTRAP: kafka:29092
+    SQLITE_PATH: /data/surveillance.db
+    PRODUCER_STATE_PATH: /data/producer_state.json
+    SOURCES: ${SOURCES:-coinbase,binance}
+    SYMBOLS: ${SYMBOLS:-BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD}
+  depends_on:
+    kafka-init:
+      condition: service_completed_successfully
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    ports:
+      - "9092:9092"            # for clients running on your laptop
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller          # KRaft mode, no ZooKeeper
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:9093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  kafka-init:                   # creates topics once, then exits
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/init/create-topics.sh"]
+    volumes:
+      - ./scripts/create-topics.sh:/init/create-topics.sh:ro
+    restart: "no"
+
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  producer:                     # duplicate-data demo: docker compose up -d --scale producer=2
+    <<: *app
+    command: ["python", "-m", "streaming.producer", "--record", "/data/recording.jsonl"]
+    volumes:
+      - app-data:/data
+
+  processor:                    # scale with: docker compose up -d --scale processor=3
+    <<: *app
+    command: ["python", "-m", "streaming.processor"]
+
+  sink:
+    <<: *app
+    command: ["python", "-m", "streaming.sink"]
+    volumes:
+      - app-data:/data
+
+  dashboard:
+    <<: *app
+    command: ["streamlit", "run", "dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0",
+              "--server.headless=true", "--browser.gatherUsageStats=false"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - app-data:/data
+
+volumes:
+  kafka-data:
+  app-data:
