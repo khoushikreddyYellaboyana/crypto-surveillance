@@ -268,13 +268,17 @@ def operations():
     def recent(df, secs=7):
         return df[df["ts_ms"] >= df["ts_ms"].max() - secs * 1000] if not df.empty else df
 
-    pr, pc, sk = recent(prod), recent(proc), recent(sink)
+    def live(df, secs=15):     # only heartbeats from the last few seconds count as "now"
+        return df[df["ts_ms"] >= now - secs * 1000] if not df.empty else df
+
+    pr, pc, sk = live(prod), live(proc), live(sink)
+    flowing = not pc.empty and pc["msgs"].sum() > 0
     k = st.columns(6)
     k[0].metric("Ingest rate", f"{pr['msgs_per_s'].sum():,.0f} msg/s" if not pr.empty else "–")
     k[1].metric("Processing rate", f"{pc['msgs_per_s'].sum():,.0f} msg/s" if not pc.empty else "–")
-    k[2].metric("End-to-end latency p95", f"{pc['latency_e2e_ms_p95'].max():,.0f} ms" if not pc.empty else "–",
+    k[2].metric("End-to-end latency p95", f"{pc['latency_e2e_ms_p95'].max():,.0f} ms" if flowing else "–",
                 help="exchange trade time → processed by our pipeline")
-    k[3].metric("Kafka hop p95", f"{pc['latency_kafka_ms_p95'].max():,.0f} ms" if not pc.empty else "–",
+    k[3].metric("Kafka hop p95", f"{pc['latency_kafka_ms_p95'].max():,.0f} ms" if flowing else "–",
                 help="producer received → processor done")
     k[4].metric("Consumer lag (processor / sink)",
                 f"{int(pc['consumer_lag'].sum()) if not pc.empty else 0:,} / "
@@ -312,15 +316,16 @@ def operations():
             if df.empty:
                 rows.append({"Component": name, "Instance": "–", "Status": "⚪ no data"})
                 continue
-            for inst, g in df.groupby("instance"):
-                lastm = g.iloc[-1]
+            last = df.sort_values("ts_ms").groupby("instance").tail(1).sort_values("ts_ms", ascending=False)
+            for i, (_, lastm) in enumerate(last.iterrows()):
                 age = (now - lastm["ts_ms"]) / 1000
-                if age > 300:          # old container (e.g. from before an update / scale-down) – hide
+                # the newest instance is ALWAYS shown (so a stopped producer is visible as down);
+                # older instances silent for > 5 min are leftovers (old version / scaled down) – hide
+                if i > 0 and age > 300:
                     continue
                 up = lastm.get("started_ms")
-                rows.append({"Component": name, "Instance": str(inst)[:12],
-                             "Status": "🟢 running" if age < 15 else "🔴 down / restarting" if age < 120
-                             else "⚫ stopped",
+                rows.append({"Component": name, "Instance": str(lastm["instance"])[:12],
+                             "Status": "🟢 running" if age < 15 else "🔴 down / stopped",
                              "Last heartbeat": f"{age:.0f} s ago",
                              "Up since": local(pd.Series([up])).iloc[0].strftime("%H:%M:%S")
                              if pd.notna(up) else "–"})
